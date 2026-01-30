@@ -1,7 +1,27 @@
 use crate::config::{LockFile, LockedMarketplace, LockedPackage, Manifest, SourceType};
-use crate::installer::{CacheManager, ClaudeCodeIntegration};
+use crate::installer::{CacheManager, ClaudeCodeIntegration, PluginScope};
 use crate::resolver::{MarketplaceResolver, PluginSource};
 use crate::{Error, Result};
+use std::path::Path;
+
+/// Determine the PluginScope from the manifest path.
+/// Global manifest (~/.config/skill-manager/plugins.toml) -> User scope
+/// Project manifest (./.claude/plugins.toml) -> Project scope with canonicalized cwd
+fn scope_from_manifest_path(manifest_path: &Path) -> Result<PluginScope> {
+    // Check if it's the global manifest by comparing with the expected global path
+    if let Some(global_path) = Manifest::global_path() {
+        if manifest_path == global_path {
+            return Ok(PluginScope::User);
+        }
+    }
+
+    // It's a project manifest - use the current working directory as the project path
+    let cwd = std::env::current_dir().map_err(|e| Error::FileRead {
+        path: std::path::PathBuf::from("."),
+        source: e,
+    })?;
+    Ok(PluginScope::Project(cwd))
+}
 
 /// Install plugins from the manifest.
 pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<()> {
@@ -19,7 +39,8 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
         .or(global_manifest)
         .ok_or(Error::NoManifest)?;
 
-    let manifest_path = manifest.path.clone().unwrap();
+    let manifest_path = manifest.path.clone().ok_or(Error::NoManifest)?;
+    let scope = scope_from_manifest_path(&manifest_path)?;
     manifest.validate()?;
 
     // Initialize components
@@ -72,9 +93,6 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
         let install_path = match pkg.source_type {
             SourceType::Local => {
                 let marketplace_path = resolver.marketplace_path(&pkg.marketplace);
-                let _plugin_entry = manifest.plugins.get(&pkg.name).ok_or_else(|| {
-                    Error::PluginNotInManifest(pkg.name.clone())
-                })?;
 
                 // Get the source path from the marketplace.json
                 let repo = resolver.ensure_marketplace(&pkg.marketplace, &marketplace.url)?;
@@ -124,6 +142,7 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
             &install_path,
             &pkg.resolved_version,
             &pkg.plugin_commit,
+            &scope,
         )?;
 
         claude.enable_plugin(&pkg.name, &pkg.marketplace)?;

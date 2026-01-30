@@ -5,11 +5,27 @@ use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
 
+/// Represents the scope of a plugin installation.
+#[derive(Debug, Clone)]
+pub enum PluginScope {
+    User,
+    Project(PathBuf),
+}
+
+/// Wrapper for installed_plugins.json v2 format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledPluginsFile {
+    pub version: u32,
+    pub plugins: HashMap<String, Vec<InstalledPluginEntry>>,
+}
+
 /// Entry in installed_plugins.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InstalledPlugin {
+pub struct InstalledPluginEntry {
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
     pub install_path: String,
     pub version: String,
     pub installed_at: String,
@@ -46,11 +62,14 @@ impl ClaudeCodeIntegration {
         self.claude_dir.join("settings.json")
     }
 
-    /// Read existing installed_plugins.json or return empty map.
-    pub fn read_installed_plugins(&self) -> Result<HashMap<String, InstalledPlugin>> {
+    /// Read existing installed_plugins.json or return empty v2 structure.
+    pub fn read_installed_plugins(&self) -> Result<InstalledPluginsFile> {
         let path = self.installed_plugins_path();
         if !path.exists() {
-            return Ok(HashMap::new());
+            return Ok(InstalledPluginsFile {
+                version: 2,
+                plugins: HashMap::new(),
+            });
         }
 
         let content = std::fs::read_to_string(&path).map_err(|e| Error::FileRead {
@@ -64,8 +83,8 @@ impl ClaudeCodeIntegration {
         })
     }
 
-    /// Write installed_plugins.json.
-    pub fn write_installed_plugins(&self, plugins: &HashMap<String, InstalledPlugin>) -> Result<()> {
+    /// Write installed_plugins.json in v2 format.
+    pub fn write_installed_plugins(&self, file: &InstalledPluginsFile) -> Result<()> {
         let path = self.installed_plugins_path();
 
         // Ensure parent directory exists
@@ -76,7 +95,7 @@ impl ClaudeCodeIntegration {
             })?;
         }
 
-        let content = serde_json::to_string_pretty(plugins).map_err(|e| Error::JsonParse {
+        let content = serde_json::to_string_pretty(file).map_err(|e| Error::JsonParse {
             path: path.clone(),
             source: e,
         })?;
@@ -88,6 +107,8 @@ impl ClaudeCodeIntegration {
     }
 
     /// Add or update a plugin in installed_plugins.json.
+    /// Uses scope-aware filter-and-replace: removes existing entries with the same scope,
+    /// preserves entries with different scopes.
     pub fn add_installed_plugin(
         &self,
         plugin_name: &str,
@@ -95,25 +116,55 @@ impl ClaudeCodeIntegration {
         install_path: &Path,
         version: &str,
         commit: &str,
+        scope: &PluginScope,
     ) -> Result<()> {
-        let mut plugins = self.read_installed_plugins()?;
+        let mut file = self.read_installed_plugins()?;
 
         let key = format!("{}@{}", plugin_name, marketplace);
         let now = chrono_iso8601_now();
 
-        plugins.insert(
-            key,
-            InstalledPlugin {
-                scope: "user".to_string(),
-                install_path: install_path.to_string_lossy().to_string(),
-                version: version.to_string(),
-                installed_at: now.clone(),
-                last_updated: now,
-                git_commit_sha: commit.to_string(),
-            },
-        );
+        // Determine scope string and project_path based on PluginScope
+        let (scope_str, project_path) = match scope {
+            PluginScope::User => ("user".to_string(), None),
+            PluginScope::Project(path) => {
+                let canonical = std::fs::canonicalize(path).map_err(|e| Error::FileRead {
+                    path: path.clone(),
+                    source: e,
+                })?;
+                ("project".to_string(), Some(canonical.to_string_lossy().to_string()))
+            }
+        };
 
-        self.write_installed_plugins(&plugins)
+        let new_entry = InstalledPluginEntry {
+            scope: scope_str.clone(),
+            project_path: project_path.clone(),
+            install_path: install_path.to_string_lossy().to_string(),
+            version: version.to_string(),
+            installed_at: now.clone(),
+            last_updated: now,
+            git_commit_sha: commit.to_string(),
+        };
+
+        // Get or create the array for this plugin key
+        let entries = file.plugins.entry(key).or_insert_with(Vec::new);
+
+        // Filter out existing entries with the same scope
+        entries.retain(|entry| {
+            if entry.scope != scope_str {
+                return true; // Keep entries with different scope types
+            }
+            // For project scope, only remove if same project path
+            if scope_str == "project" {
+                return entry.project_path != project_path;
+            }
+            // For user scope, remove the existing entry
+            false
+        });
+
+        // Add the new entry
+        entries.push(new_entry);
+
+        self.write_installed_plugins(&file)
     }
 
     /// Read existing settings.json or return empty object.
@@ -182,61 +233,77 @@ impl ClaudeCodeIntegration {
     }
 }
 
-/// Get current time in ISO 8601 format.
+/// Get current time in ISO 8601 format (UTC).
 fn chrono_iso8601_now() -> String {
     use std::time::SystemTime;
 
-    let now = SystemTime::now();
-    let duration = now.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    let secs = duration.as_secs();
+    const SECONDS_PER_DAY: u64 = 86400;
+    const SECONDS_PER_HOUR: u64 = 3600;
+    const SECONDS_PER_MINUTE: u64 = 60;
 
-    // Simple ISO 8601 format without external crate
-    // This is approximate but sufficient for our needs
-    let days_since_epoch = secs / 86400;
-    let time_of_day = secs % 86400;
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    // Calculate year/month/day (simplified, not accounting for leap years perfectly)
-    let mut year = 1970;
-    let mut remaining_days = days_since_epoch as i64;
+    let days_since_epoch = secs / SECONDS_PER_DAY;
+    let time_of_day = secs % SECONDS_PER_DAY;
 
-    loop {
-        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            366
-        } else {
-            365
-        };
-        if remaining_days < days_in_year {
-            break;
-        }
-        remaining_days -= days_in_year;
-        year += 1;
-    }
+    // Calculate year from days since epoch
+    let (year, remaining_days) = year_from_days(days_since_epoch);
 
-    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_months: [i64; 12] = if is_leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
+    // Calculate month and day
+    let (month, day) = month_day_from_days(year, remaining_days);
 
-    let mut month = 1;
-    for days in days_in_months {
-        if remaining_days < days {
-            break;
-        }
-        remaining_days -= days;
-        month += 1;
-    }
-
-    let day = remaining_days + 1;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
+    // Calculate time components
+    let hours = time_of_day / SECONDS_PER_HOUR;
+    let minutes = (time_of_day % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
+    let seconds = time_of_day % SECONDS_PER_MINUTE;
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
     )
+}
+
+/// Calculate year and remaining days from days since Unix epoch.
+fn year_from_days(days_since_epoch: u64) -> (i32, u64) {
+    let mut year = 1970;
+    let mut remaining = days_since_epoch;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            return (year, remaining);
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+}
+
+/// Calculate month (1-12) and day (1-31) from year and day-of-year.
+fn month_day_from_days(year: i32, day_of_year: u64) -> (u32, u32) {
+    let days_in_months: [u64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut remaining = day_of_year;
+    for (i, &days) in days_in_months.iter().enumerate() {
+        if remaining < days {
+            return ((i + 1) as u32, (remaining + 1) as u32);
+        }
+        remaining -= days;
+    }
+
+    // Fallback (should not reach)
+    (12, 31)
+}
+
+/// Check if a year is a leap year.
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -249,8 +316,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
 
-        let plugins = integration.read_installed_plugins().unwrap();
-        assert!(plugins.is_empty());
+        let file = integration.read_installed_plugins().unwrap();
+        assert!(file.plugins.is_empty());
+        assert_eq!(file.version, 2);
     }
 
     #[test]
@@ -259,28 +327,38 @@ mod tests {
         let plugins_dir = temp_dir.path().join("plugins");
         fs::create_dir_all(&plugins_dir).unwrap();
 
+        // v2 format with wrapper and arrays
         let content = r#"{
-            "superpowers@official": {
-                "scope": "user",
-                "installPath": "/path/to/plugin",
-                "version": "4.1.1",
-                "installedAt": "2024-01-01T00:00:00Z",
-                "lastUpdated": "2024-01-01T00:00:00Z",
-                "gitCommitSha": "abc123"
+            "version": 2,
+            "plugins": {
+                "superpowers@official": [
+                    {
+                        "scope": "user",
+                        "installPath": "/path/to/plugin",
+                        "version": "4.1.1",
+                        "installedAt": "2024-01-01T00:00:00Z",
+                        "lastUpdated": "2024-01-01T00:00:00Z",
+                        "gitCommitSha": "abc123"
+                    }
+                ]
             }
         }"#;
         fs::write(plugins_dir.join("installed_plugins.json"), content).unwrap();
 
         let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
-        let plugins = integration.read_installed_plugins().unwrap();
+        let file = integration.read_installed_plugins().unwrap();
 
-        assert_eq!(plugins.len(), 1);
-        assert!(plugins.contains_key("superpowers@official"));
-        assert_eq!(plugins["superpowers@official"].version, "4.1.1");
+        assert_eq!(file.version, 2);
+        assert_eq!(file.plugins.len(), 1);
+        assert!(file.plugins.contains_key("superpowers@official"));
+        let entries = &file.plugins["superpowers@official"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, "4.1.1");
+        assert_eq!(entries[0].scope, "user");
     }
 
     #[test]
-    fn test_add_installed_plugin() {
+    fn test_add_installed_plugin_user_scope() {
         let temp_dir = tempfile::tempdir().unwrap();
         let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
 
@@ -291,14 +369,174 @@ mod tests {
                 Path::new("/path/to/plugin"),
                 "1.0.0",
                 "abc123",
+                &PluginScope::User,
             )
             .unwrap();
 
-        let plugins = integration.read_installed_plugins().unwrap();
-        assert_eq!(plugins.len(), 1);
-        assert!(plugins.contains_key("test-plugin@official"));
-        assert_eq!(plugins["test-plugin@official"].version, "1.0.0");
-        assert_eq!(plugins["test-plugin@official"].git_commit_sha, "abc123");
+        let file = integration.read_installed_plugins().unwrap();
+        assert_eq!(file.version, 2);
+        assert_eq!(file.plugins.len(), 1);
+        assert!(file.plugins.contains_key("test-plugin@official"));
+
+        let entries = &file.plugins["test-plugin@official"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, "1.0.0");
+        assert_eq!(entries[0].git_commit_sha, "abc123");
+        assert_eq!(entries[0].scope, "user");
+        assert!(entries[0].project_path.is_none());
+    }
+
+    #[test]
+    fn test_add_installed_plugin_project_scope() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("my-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/plugin"),
+                "1.0.0",
+                "abc123",
+                &PluginScope::Project(project_dir.clone()),
+            )
+            .unwrap();
+
+        let file = integration.read_installed_plugins().unwrap();
+        let entries = &file.plugins["test-plugin@official"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].scope, "project");
+        assert!(entries[0].project_path.is_some());
+        // The path should be canonicalized
+        let canonical = fs::canonicalize(&project_dir).unwrap();
+        assert_eq!(entries[0].project_path.as_ref().unwrap(), &canonical.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_add_installed_plugin_preserves_different_scopes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("my-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        // First, add a user-scope entry
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/user-plugin"),
+                "1.0.0",
+                "user123",
+                &PluginScope::User,
+            )
+            .unwrap();
+
+        // Then add a project-scope entry for the same plugin
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/project-plugin"),
+                "2.0.0",
+                "project456",
+                &PluginScope::Project(project_dir.clone()),
+            )
+            .unwrap();
+
+        // Both entries should be preserved
+        let file = integration.read_installed_plugins().unwrap();
+        let entries = &file.plugins["test-plugin@official"];
+        assert_eq!(entries.len(), 2);
+
+        // Find user and project entries
+        let user_entry = entries.iter().find(|e| e.scope == "user").unwrap();
+        let project_entry = entries.iter().find(|e| e.scope == "project").unwrap();
+
+        assert_eq!(user_entry.version, "1.0.0");
+        assert_eq!(user_entry.git_commit_sha, "user123");
+        assert!(user_entry.project_path.is_none());
+
+        assert_eq!(project_entry.version, "2.0.0");
+        assert_eq!(project_entry.git_commit_sha, "project456");
+        assert!(project_entry.project_path.is_some());
+    }
+
+    #[test]
+    fn test_add_installed_plugin_replaces_same_scope() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        // Add user-scope entry
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/plugin-v1"),
+                "1.0.0",
+                "commit1",
+                &PluginScope::User,
+            )
+            .unwrap();
+
+        // Update user-scope entry (should replace, not add)
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/plugin-v2"),
+                "2.0.0",
+                "commit2",
+                &PluginScope::User,
+            )
+            .unwrap();
+
+        let file = integration.read_installed_plugins().unwrap();
+        let entries = &file.plugins["test-plugin@official"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, "2.0.0");
+        assert_eq!(entries[0].git_commit_sha, "commit2");
+    }
+
+    #[test]
+    fn test_add_installed_plugin_replaces_same_project_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("my-project");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        // Add project-scope entry
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/plugin-v1"),
+                "1.0.0",
+                "commit1",
+                &PluginScope::Project(project_dir.clone()),
+            )
+            .unwrap();
+
+        // Update same project-scope entry (should replace, not add)
+        integration
+            .add_installed_plugin(
+                "test-plugin",
+                "official",
+                Path::new("/path/to/plugin-v2"),
+                "2.0.0",
+                "commit2",
+                &PluginScope::Project(project_dir.clone()),
+            )
+            .unwrap();
+
+        let file = integration.read_installed_plugins().unwrap();
+        let entries = &file.plugins["test-plugin@official"];
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, "2.0.0");
     }
 
     #[test]
