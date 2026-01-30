@@ -2,6 +2,7 @@ use git2::{FetchOptions, RemoteCallbacks, Repository};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::{debug, instrument, trace};
 
 use crate::{Error, Result};
 
@@ -39,18 +40,24 @@ impl MarketplaceResolver {
     }
 
     /// Clone or fetch a marketplace repository.
+    #[instrument(skip(self), fields(path))]
     pub fn ensure_marketplace(&self, name: &str, url: &str) -> Result<Repository> {
         let path = self.marketplace_path(name);
+        tracing::Span::current().record("path", path.display().to_string());
 
         if path.exists() {
+            debug!("marketplace exists locally, fetching updates");
             self.fetch_marketplace(name, &path)
         } else {
+            debug!("marketplace not found locally, cloning");
             self.clone_marketplace(name, url, &path)
         }
     }
 
     /// Clone a marketplace to the cache.
+    #[instrument(skip(self))]
     fn clone_marketplace(&self, name: &str, url: &str, path: &Path) -> Result<Repository> {
+        debug!(path = %path.display(), "creating cache directory");
         std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
             .map_err(Error::CacheCreate)?;
 
@@ -79,7 +86,9 @@ impl MarketplaceResolver {
     }
 
     /// Fetch updates for an existing marketplace clone.
+    #[instrument(skip(self))]
     fn fetch_marketplace(&self, name: &str, path: &Path) -> Result<Repository> {
+        debug!(path = %path.display(), "opening existing repository");
         let repo = Repository::open(path).map_err(|e| Error::MarketplaceClone {
             name: name.to_string(),
             source: e,
@@ -140,55 +149,87 @@ impl MarketplaceResolver {
     }
 
     /// Checkout a specific commit.
+    #[instrument(skip(self, repo))]
     pub fn checkout_commit(&self, repo: &Repository, marketplace: &str, commit: &str) -> Result<()> {
+        debug!("parsing commit oid");
         let oid = git2::Oid::from_str(commit).map_err(|_| Error::CommitNotFound {
             marketplace: marketplace.to_string(),
             commit: commit.to_string(),
         })?;
 
+        debug!("finding commit object");
         let commit_obj = repo.find_commit(oid).map_err(|_| Error::CommitNotFound {
             marketplace: marketplace.to_string(),
             commit: commit.to_string(),
         })?;
 
+        debug!("checking out tree");
         repo.checkout_tree(commit_obj.as_object(), Some(git2::build::CheckoutBuilder::new().force()))
             .map_err(Error::Git)?;
 
+        debug!("setting HEAD to detached state");
         repo.set_head_detached(oid).map_err(Error::Git)?;
 
+        debug!("checkout complete");
         Ok(())
     }
 
     /// Parse marketplace.json from a repository.
+    #[instrument(skip(self, repo))]
     pub fn parse_marketplace_json(&self, repo: &Repository, marketplace: &str) -> Result<MarketplaceJson> {
-        let workdir = repo.workdir().ok_or_else(|| Error::MarketplaceJsonNotFound(marketplace.to_string()))?;
-        let json_path = workdir.join("marketplace.json");
+        let workdir = repo.workdir().ok_or_else(|| {
+            debug!("repository has no workdir (bare repository?)");
+            Error::MarketplaceJsonNotFound(marketplace.to_string())
+        })?;
+
+        let json_path = workdir.join(".claude-plugin").join("marketplace.json");
+        debug!(path = %json_path.display(), "looking for marketplace.json");
 
         if !json_path.exists() {
+            debug!(path = %json_path.display(), "marketplace.json not found");
             return Err(Error::MarketplaceJsonNotFound(marketplace.to_string()));
         }
 
+        debug!("reading marketplace.json");
         let content = std::fs::read_to_string(&json_path).map_err(|e| Error::FileRead {
             path: json_path.clone(),
             source: e,
         })?;
+        trace!(content_len = content.len(), "marketplace.json content loaded");
 
-        serde_json::from_str(&content).map_err(|e| Error::MarketplaceJsonParse {
-            name: marketplace.to_string(),
-            reason: e.to_string(),
-        })
+        debug!("parsing marketplace.json");
+        let parsed: MarketplaceJson = serde_json::from_str(&content).map_err(|e| {
+            debug!(error = %e, "failed to parse marketplace.json");
+            Error::MarketplaceJsonParse {
+                name: marketplace.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        debug!(plugin_count = parsed.plugins.len(), "marketplace.json parsed successfully");
+        trace!(plugins = ?parsed.plugins.keys().collect::<Vec<_>>(), "available plugins");
+
+        Ok(parsed)
     }
 
     /// Find a plugin in a marketplace.
+    #[instrument(skip(self, marketplace_json))]
     pub fn find_plugin<'a>(
         &self,
         marketplace_json: &'a MarketplaceJson,
         marketplace: &str,
         plugin: &str,
     ) -> Result<&'a MarketplacePlugin> {
-        marketplace_json.plugins.get(plugin).ok_or_else(|| Error::PluginNotFound {
-            plugin: plugin.to_string(),
-            marketplace: marketplace.to_string(),
+        debug!("searching for plugin in marketplace.json");
+        marketplace_json.plugins.get(plugin).ok_or_else(|| {
+            debug!(
+                available = ?marketplace_json.plugins.keys().collect::<Vec<_>>(),
+                "plugin not found in marketplace"
+            );
+            Error::PluginNotFound {
+                plugin: plugin.to_string(),
+                marketplace: marketplace.to_string(),
+            }
         })
     }
 }
@@ -201,7 +242,10 @@ mod tests {
     fn setup_test_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
 
-        // Create a marketplace.json
+        // Create .claude-plugins directory and marketplace.json
+        let plugins_dir = dir.join(".claude-plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
         let json_content = r#"{
             "plugins": {
                 "test-plugin": {
@@ -214,12 +258,12 @@ mod tests {
                 }
             }
         }"#;
-        fs::write(dir.join("marketplace.json"), json_content).unwrap();
+        fs::write(plugins_dir.join("marketplace.json"), json_content).unwrap();
 
         // Commit the file
         {
             let mut index = repo.index().unwrap();
-            index.add_path(Path::new("marketplace.json")).unwrap();
+            index.add_path(Path::new(".claude-plugins/marketplace.json")).unwrap();
             index.write().unwrap();
             let tree_id = index.write_tree().unwrap();
             let tree = repo.find_tree(tree_id).unwrap();
