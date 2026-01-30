@@ -1,0 +1,18 @@
+[package]
+name = "skill-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.56", features = ["derive"] }
+git2 = "0.20.3"
+rootcause = "0.11.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+toml = "0.9.11"
+toml_edit = "0.24.0"
+xdg = "3.0.0"
+
+[dev-dependencies]
+tempfile = "3.24.0"
