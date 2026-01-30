@@ -2,7 +2,7 @@ use git2::Repository;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-use super::marketplace::{MarketplacePlugin, MarketplaceResolver};
+use super::marketplace::{MarketplacePlugin, MarketplaceResolver, PluginSource};
 use crate::config::SourceType;
 use crate::{Error, Result};
 
@@ -39,29 +39,27 @@ impl MarketplaceResolver {
         requested_tag: Option<&str>,
         requested_commit: Option<&str>,
     ) -> Result<ResolvedPlugin> {
-        if let Some(path) = &plugin_info.path {
-            // Local plugin - lives within the marketplace repo
-            self.resolve_local_plugin(
-                marketplace_name,
-                marketplace_commit,
-                plugin_name,
-                path,
-            )
-        } else if let Some(url) = &plugin_info.url {
-            // External plugin - separate git repository
-            self.resolve_external_plugin(
-                marketplace_name,
-                marketplace_commit,
-                plugin_name,
-                url,
-                requested_tag,
-                requested_commit,
-            )
-        } else {
-            Err(Error::PluginNotFound {
-                plugin: plugin_name.to_string(),
-                marketplace: marketplace_name.to_string(),
-            })
+        match &plugin_info.source {
+            PluginSource::Local(path) => {
+                // Local plugin - lives within the marketplace repo
+                self.resolve_local_plugin(
+                    marketplace_name,
+                    marketplace_commit,
+                    plugin_name,
+                    path,
+                )
+            }
+            PluginSource::External { url, .. } => {
+                // External plugin - separate git repository
+                self.resolve_external_plugin(
+                    marketplace_name,
+                    marketplace_commit,
+                    plugin_name,
+                    url,
+                    requested_tag,
+                    requested_commit,
+                )
+            }
         }
     }
 
@@ -282,8 +280,8 @@ mod tests {
 
         let resolver = MarketplaceResolver::new(temp_dir.path().to_path_buf());
         let plugin_info = super::super::marketplace::MarketplacePlugin {
-            path: Some("plugins/local-plugin".to_string()),
-            url: None,
+            name: "local-plugin".to_string(),
+            source: PluginSource::Local("plugins/local-plugin".to_string()),
             description: Some("A local plugin".to_string()),
         };
 

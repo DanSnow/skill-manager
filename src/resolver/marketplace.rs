@@ -1,18 +1,27 @@
 use git2::{FetchOptions, RemoteCallbacks, Repository};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, instrument, trace};
 
 use crate::{Error, Result};
 
+/// Source location for a plugin - either local path or external URL.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PluginSource {
+    /// Local path within the marketplace repository.
+    Local(String),
+    /// External repository with URL.
+    External { source: String, url: String },
+}
+
 /// Metadata for a plugin entry in marketplace.json.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplacePlugin {
-    /// Local path within marketplace (for local plugins).
-    pub path: Option<String>,
-    /// Git URL for external plugin repository.
-    pub url: Option<String>,
+    /// Plugin identifier.
+    pub name: String,
+    /// Source location (local path or external URL).
+    pub source: PluginSource,
     /// Optional description.
     pub description: Option<String>,
 }
@@ -20,7 +29,7 @@ pub struct MarketplacePlugin {
 /// Parsed marketplace.json structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceJson {
-    pub plugins: HashMap<String, MarketplacePlugin>,
+    pub plugins: Vec<MarketplacePlugin>,
 }
 
 /// Operations for working with marketplace git repositories.
@@ -207,7 +216,7 @@ impl MarketplaceResolver {
         })?;
 
         debug!(plugin_count = parsed.plugins.len(), "marketplace.json parsed successfully");
-        trace!(plugins = ?parsed.plugins.keys().collect::<Vec<_>>(), "available plugins");
+        trace!(plugins = ?parsed.plugins.iter().map(|p| &p.name).collect::<Vec<_>>(), "available plugins");
 
         Ok(parsed)
     }
@@ -221,16 +230,20 @@ impl MarketplaceResolver {
         plugin: &str,
     ) -> Result<&'a MarketplacePlugin> {
         debug!("searching for plugin in marketplace.json");
-        marketplace_json.plugins.get(plugin).ok_or_else(|| {
-            debug!(
-                available = ?marketplace_json.plugins.keys().collect::<Vec<_>>(),
-                "plugin not found in marketplace"
-            );
-            Error::PluginNotFound {
-                plugin: plugin.to_string(),
-                marketplace: marketplace.to_string(),
-            }
-        })
+        marketplace_json
+            .plugins
+            .iter()
+            .find(|p| p.name == plugin)
+            .ok_or_else(|| {
+                debug!(
+                    available = ?marketplace_json.plugins.iter().map(|p| &p.name).collect::<Vec<_>>(),
+                    "plugin not found in marketplace"
+                );
+                Error::PluginNotFound {
+                    plugin: plugin.to_string(),
+                    marketplace: marketplace.to_string(),
+                }
+            })
     }
 }
 
@@ -242,28 +255,30 @@ mod tests {
     fn setup_test_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
 
-        // Create .claude-plugins directory and marketplace.json
-        let plugins_dir = dir.join(".claude-plugins");
+        // Create .claude-plugin directory and marketplace.json
+        let plugins_dir = dir.join(".claude-plugin");
         fs::create_dir_all(&plugins_dir).unwrap();
 
         let json_content = r#"{
-            "plugins": {
-                "test-plugin": {
-                    "path": "plugins/test-plugin",
+            "plugins": [
+                {
+                    "name": "test-plugin",
+                    "source": "./plugins/test-plugin",
                     "description": "A test plugin"
                 },
-                "external-plugin": {
-                    "url": "https://github.com/example/external.git",
+                {
+                    "name": "external-plugin",
+                    "source": {"source": "url", "url": "https://github.com/example/external.git"},
                     "description": "An external plugin"
                 }
-            }
+            ]
         }"#;
         fs::write(plugins_dir.join("marketplace.json"), json_content).unwrap();
 
         // Commit the file
         {
             let mut index = repo.index().unwrap();
-            index.add_path(Path::new(".claude-plugins/marketplace.json")).unwrap();
+            index.add_path(Path::new(".claude-plugin/marketplace.json")).unwrap();
             index.write().unwrap();
             let tree_id = index.write_tree().unwrap();
             let tree = repo.find_tree(tree_id).unwrap();
@@ -283,19 +298,15 @@ mod tests {
         let resolver = MarketplaceResolver::new(temp_dir.path().to_path_buf());
         let json = resolver.parse_marketplace_json(&repo, "test").unwrap();
 
-        assert!(json.plugins.contains_key("test-plugin"));
-        assert!(json.plugins.contains_key("external-plugin"));
+        assert_eq!(json.plugins.len(), 2);
+        assert!(json.plugins.iter().any(|p| p.name == "test-plugin"));
+        assert!(json.plugins.iter().any(|p| p.name == "external-plugin"));
 
-        let local = &json.plugins["test-plugin"];
-        assert_eq!(local.path, Some("plugins/test-plugin".to_string()));
-        assert!(local.url.is_none());
+        let local = json.plugins.iter().find(|p| p.name == "test-plugin").unwrap();
+        assert!(matches!(&local.source, PluginSource::Local(path) if path == "./plugins/test-plugin"));
 
-        let external = &json.plugins["external-plugin"];
-        assert!(external.path.is_none());
-        assert_eq!(
-            external.url,
-            Some("https://github.com/example/external.git".to_string())
-        );
+        let external = json.plugins.iter().find(|p| p.name == "external-plugin").unwrap();
+        assert!(matches!(&external.source, PluginSource::External { url, .. } if url == "https://github.com/example/external.git"));
     }
 
     #[test]
@@ -319,7 +330,8 @@ mod tests {
         let json = resolver.parse_marketplace_json(&repo, "test").unwrap();
 
         let plugin = resolver.find_plugin(&json, "test", "test-plugin").unwrap();
-        assert_eq!(plugin.path, Some("plugins/test-plugin".to_string()));
+        assert_eq!(plugin.name, "test-plugin");
+        assert!(matches!(&plugin.source, PluginSource::Local(path) if path == "./plugins/test-plugin"));
 
         let result = resolver.find_plugin(&json, "test", "nonexistent");
         assert!(matches!(result, Err(Error::PluginNotFound { .. })));

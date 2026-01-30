@@ -1,6 +1,6 @@
 use crate::config::{LockFile, LockedMarketplace, LockedPackage, Manifest, SourceType};
 use crate::installer::{CacheManager, ClaudeCodeIntegration};
-use crate::resolver::MarketplaceResolver;
+use crate::resolver::{MarketplaceResolver, PluginSource};
 use crate::{Error, Result};
 
 /// Install plugins from the manifest.
@@ -82,12 +82,15 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
                 let mkt_json = resolver.parse_marketplace_json(&repo, &pkg.marketplace)?;
                 let plugin_info = resolver.find_plugin(&mkt_json, &pkg.marketplace, &pkg.name)?;
 
-                let source_path = plugin_info.path.as_ref().ok_or_else(|| {
-                    Error::PluginNotFound {
-                        plugin: pkg.name.clone(),
-                        marketplace: pkg.marketplace.clone(),
+                let source_path = match &plugin_info.source {
+                    PluginSource::Local(path) => path,
+                    PluginSource::External { .. } => {
+                        return Err(Error::PluginNotFound {
+                            plugin: pkg.name.clone(),
+                            marketplace: pkg.marketplace.clone(),
+                        });
                     }
-                })?;
+                };
 
                 cache.extract_local_plugin(
                     &marketplace_path,
