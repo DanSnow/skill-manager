@@ -19,6 +19,16 @@ pub struct InstalledPluginsFile {
     pub plugins: HashMap<String, Vec<InstalledPluginEntry>>,
 }
 
+/// Entry in known_marketplaces.json.
+/// Uses serde_json::Value for source to preserve any source type (github, url, directory, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownMarketplaceEntry {
+    pub source: Value,
+    pub install_location: String,
+    pub last_updated: String,
+}
+
 /// Entry in installed_plugins.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +70,55 @@ impl ClaudeCodeIntegration {
     /// Get the path to settings.json.
     pub fn settings_path(&self) -> PathBuf {
         self.claude_dir.join("settings.json")
+    }
+
+    /// Get the path to known_marketplaces.json.
+    pub fn known_marketplaces_path(&self) -> PathBuf {
+        self.claude_dir.join("plugins").join("known_marketplaces.json")
+    }
+
+    /// Read existing known_marketplaces.json or return empty HashMap.
+    pub fn read_known_marketplaces(&self) -> Result<HashMap<String, KnownMarketplaceEntry>> {
+        let path = self.known_marketplaces_path();
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let content = std::fs::read_to_string(&path).map_err(|e| Error::FileRead {
+            path: path.clone(),
+            source: e,
+        })?;
+
+        serde_json::from_str(&content).map_err(|e| Error::JsonParse {
+            path,
+            source: e,
+        })
+    }
+
+    /// Write known_marketplaces.json.
+    pub fn write_known_marketplaces(
+        &self,
+        marketplaces: &HashMap<String, KnownMarketplaceEntry>,
+    ) -> Result<()> {
+        let path = self.known_marketplaces_path();
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::FileWrite {
+                path: path.clone(),
+                source: e,
+            })?;
+        }
+
+        let content = serde_json::to_string_pretty(marketplaces).map_err(|e| Error::JsonParse {
+            path: path.clone(),
+            source: e,
+        })?;
+
+        std::fs::write(&path, content).map_err(|e| Error::FileWrite {
+            path,
+            source: e,
+        })
     }
 
     /// Read existing installed_plugins.json or return empty v2 structure.
@@ -231,6 +290,29 @@ impl ClaudeCodeIntegration {
 
         self.write_settings(&settings)
     }
+
+    /// Register a marketplace in known_marketplaces.json.
+    /// Uses directory source type pointing to the marketplace cache path.
+    pub fn register_marketplace(&self, name: &str, cache_path: &Path) -> Result<()> {
+        let mut marketplaces = self.read_known_marketplaces()?;
+
+        let entry = KnownMarketplaceEntry {
+            source: make_directory_source(cache_path),
+            install_location: cache_path.to_string_lossy().to_string(),
+            last_updated: chrono_iso8601_now(),
+        };
+
+        marketplaces.insert(name.to_string(), entry);
+        self.write_known_marketplaces(&marketplaces)
+    }
+}
+
+/// Create a directory source value for known_marketplaces.json.
+fn make_directory_source(path: &Path) -> Value {
+    json!({
+        "source": "directory",
+        "path": path.to_string_lossy()
+    })
 }
 
 /// Get current time in ISO 8601 format (UTC).
@@ -596,5 +678,195 @@ mod tests {
         assert_eq!(timestamp.len(), 20);
         assert!(timestamp.ends_with('Z'));
         assert!(timestamp.contains('T'));
+    }
+
+    #[test]
+    fn test_read_known_marketplaces_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+        assert!(marketplaces.is_empty());
+    }
+
+    #[test]
+    fn test_read_known_marketplaces_with_github_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        // File with github source type (as created by Claude Code itself)
+        let content = r#"{
+            "claude-plugins-official": {
+                "source": {
+                    "source": "github",
+                    "repo": "anthropics/claude-plugins-official"
+                },
+                "installLocation": "/Users/test/.claude/plugins/marketplaces/claude-plugins-official",
+                "lastUpdated": "2026-01-01T00:00:00Z"
+            }
+        }"#;
+        fs::write(plugins_dir.join("known_marketplaces.json"), content).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+
+        assert_eq!(marketplaces.len(), 1);
+        assert!(marketplaces.contains_key("claude-plugins-official"));
+
+        let entry = &marketplaces["claude-plugins-official"];
+        assert_eq!(entry.source["source"], "github");
+        assert_eq!(entry.source["repo"], "anthropics/claude-plugins-official");
+    }
+
+    #[test]
+    fn test_read_known_marketplaces_with_directory_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        // File with directory source type (as created by skill-manager)
+        let content = r#"{
+            "my-marketplace": {
+                "source": {
+                    "source": "directory",
+                    "path": "/Users/test/.cache/skill-manager/marketplaces/my-marketplace"
+                },
+                "installLocation": "/Users/test/.cache/skill-manager/marketplaces/my-marketplace",
+                "lastUpdated": "2026-01-01T00:00:00Z"
+            }
+        }"#;
+        fs::write(plugins_dir.join("known_marketplaces.json"), content).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+
+        assert_eq!(marketplaces.len(), 1);
+        let entry = &marketplaces["my-marketplace"];
+        assert_eq!(entry.source["source"], "directory");
+    }
+
+    #[test]
+    fn test_read_known_marketplaces_mixed_source_types() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        // File with mixed source types
+        let content = r#"{
+            "claude-plugins-official": {
+                "source": {
+                    "source": "github",
+                    "repo": "anthropics/claude-plugins-official"
+                },
+                "installLocation": "/path/to/official",
+                "lastUpdated": "2026-01-01T00:00:00Z"
+            },
+            "my-marketplace": {
+                "source": {
+                    "source": "directory",
+                    "path": "/path/to/my-marketplace"
+                },
+                "installLocation": "/path/to/my-marketplace",
+                "lastUpdated": "2026-01-02T00:00:00Z"
+            }
+        }"#;
+        fs::write(plugins_dir.join("known_marketplaces.json"), content).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+
+        assert_eq!(marketplaces.len(), 2);
+        assert_eq!(marketplaces["claude-plugins-official"].source["source"], "github");
+        assert_eq!(marketplaces["my-marketplace"].source["source"], "directory");
+    }
+
+    #[test]
+    fn test_register_marketplace_new_entry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+
+        let cache_path = Path::new("/Users/test/.cache/skill-manager/marketplaces/my-marketplace");
+        integration.register_marketplace("my-marketplace", cache_path).unwrap();
+
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+        assert_eq!(marketplaces.len(), 1);
+
+        let entry = &marketplaces["my-marketplace"];
+        assert_eq!(entry.source["source"], "directory");
+        assert_eq!(entry.source["path"], cache_path.to_str().unwrap());
+        assert_eq!(entry.install_location, cache_path.to_str().unwrap());
+        assert!(!entry.last_updated.is_empty());
+    }
+
+    #[test]
+    fn test_register_marketplace_updates_existing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        // Create existing entry
+        let content = r#"{
+            "my-marketplace": {
+                "source": {
+                    "source": "directory",
+                    "path": "/old/path"
+                },
+                "installLocation": "/old/path",
+                "lastUpdated": "2025-01-01T00:00:00Z"
+            }
+        }"#;
+        fs::write(plugins_dir.join("known_marketplaces.json"), content).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+        let new_path = Path::new("/new/path/to/marketplace");
+        integration.register_marketplace("my-marketplace", new_path).unwrap();
+
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+        assert_eq!(marketplaces.len(), 1);
+
+        let entry = &marketplaces["my-marketplace"];
+        assert_eq!(entry.source["path"], new_path.to_str().unwrap());
+        assert_eq!(entry.install_location, new_path.to_str().unwrap());
+        // Timestamp should be updated
+        assert_ne!(entry.last_updated, "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_register_marketplace_preserves_other_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let plugins_dir = temp_dir.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+
+        // Create existing entry with github source (from Claude Code)
+        let content = r#"{
+            "claude-plugins-official": {
+                "source": {
+                    "source": "github",
+                    "repo": "anthropics/claude-plugins-official"
+                },
+                "installLocation": "/Users/test/.claude/plugins/marketplaces/claude-plugins-official",
+                "lastUpdated": "2026-01-01T00:00:00Z"
+            }
+        }"#;
+        fs::write(plugins_dir.join("known_marketplaces.json"), content).unwrap();
+
+        let integration = ClaudeCodeIntegration::with_claude_dir(temp_dir.path().to_path_buf());
+        let new_path = Path::new("/path/to/my-marketplace");
+        integration.register_marketplace("my-marketplace", new_path).unwrap();
+
+        let marketplaces = integration.read_known_marketplaces().unwrap();
+        assert_eq!(marketplaces.len(), 2);
+
+        // Original entry should be preserved exactly
+        let official = &marketplaces["claude-plugins-official"];
+        assert_eq!(official.source["source"], "github");
+        assert_eq!(official.source["repo"], "anthropics/claude-plugins-official");
+        assert_eq!(official.last_updated, "2026-01-01T00:00:00Z");
+
+        // New entry should be added
+        let my_mkt = &marketplaces["my-marketplace"];
+        assert_eq!(my_mkt.source["source"], "directory");
+        assert_eq!(my_mkt.source["path"], new_path.to_str().unwrap());
     }
 }

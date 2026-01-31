@@ -79,6 +79,12 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
         println!("Wrote {}", lock_path.display());
     }
 
+    // Register marketplaces with Claude Code
+    for marketplace in &locked_marketplaces {
+        let marketplace_path = resolver.marketplace_path(&marketplace.name);
+        claude.register_marketplace(&marketplace.name, &marketplace_path)?;
+    }
+
     // Install plugins
     let mut installed_count = 0;
     for pkg in &locked_packages {

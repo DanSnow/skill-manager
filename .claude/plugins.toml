@@ -1,0 +1,10 @@
+# skill-manager plugins manifest
+# See https://github.com/example/skill-manager for documentation
+
+[marketplaces]
+# Add marketplace sources here
+official = "anthropics/claude-plugins-official"
+
+[plugins]
+# Add plugins here
+code-simplifier = { marketplace = "official" }
