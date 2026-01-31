@@ -1,7 +1,10 @@
 pub mod cli;
 pub mod config;
 pub mod installer;
+pub mod layout;
 pub mod resolver;
+
+pub use layout::PluginLayout;
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -102,3 +105,4 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
+

@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::{debug, instrument, trace};
 
+use crate::layout::PluginLayout;
 use crate::{Error, Result};
 
 /// Source location for a plugin - either local path or external URL.
@@ -191,7 +192,8 @@ impl MarketplaceResolver {
             Error::MarketplaceJsonNotFound(marketplace.to_string())
         })?;
 
-        let json_path = workdir.join(".claude-plugin").join("marketplace.json");
+        let layout = PluginLayout::new(workdir);
+        let json_path = layout.marketplace_json();
         debug!(path = %json_path.display(), "looking for marketplace.json");
 
         if !json_path.exists() {
@@ -200,8 +202,8 @@ impl MarketplaceResolver {
         }
 
         debug!("reading marketplace.json");
-        let content = std::fs::read_to_string(&json_path).map_err(|e| Error::FileRead {
-            path: json_path.clone(),
+        let content = std::fs::read_to_string(json_path).map_err(|e| Error::FileRead {
+            path: json_path.to_path_buf(),
             source: e,
         })?;
         trace!(content_len = content.len(), "marketplace.json content loaded");
