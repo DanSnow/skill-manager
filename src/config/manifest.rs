@@ -1,5 +1,7 @@
-use serde::Deserialize;
-use std::collections::HashMap;
+use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Result};
@@ -60,6 +62,29 @@ struct RawPlugin {
 
 /// Manifest file locations.
 pub const MANIFEST_FILENAME: &str = "plugins.toml";
+
+/// Normalized marketplace entry for deterministic hashing.
+#[derive(Debug, Clone, Serialize)]
+struct NormalizedMarketplaceEntry {
+    url: String,
+    tag: Option<String>,
+    commit: Option<String>,
+}
+
+/// Normalized plugin entry for deterministic hashing.
+#[derive(Debug, Clone, Serialize)]
+struct NormalizedPluginEntry {
+    marketplace: String,
+    tag: Option<String>,
+    commit: Option<String>,
+}
+
+/// Normalized manifest with sorted keys for deterministic hashing.
+#[derive(Debug, Clone, Serialize)]
+struct NormalizedManifest {
+    marketplaces: BTreeMap<String, NormalizedMarketplaceEntry>,
+    plugins: BTreeMap<String, NormalizedPluginEntry>,
+}
 
 impl Manifest {
     /// Get the global manifest path (~/.config/skill-manager/plugins.toml).
@@ -156,6 +181,55 @@ impl Manifest {
             }
         }
         Ok(())
+    }
+
+    /// Convert to a normalized form with sorted keys for deterministic hashing.
+    fn to_normalized(&self) -> NormalizedManifest {
+        let marketplaces = self
+            .marketplaces
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    NormalizedMarketplaceEntry {
+                        url: entry.url.clone(),
+                        tag: entry.tag.clone(),
+                        commit: entry.commit.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let plugins = self
+            .plugins
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    NormalizedPluginEntry {
+                        marketplace: entry.marketplace.clone(),
+                        tag: entry.tag.clone(),
+                        commit: entry.commit.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        NormalizedManifest {
+            marketplaces,
+            plugins,
+        }
+    }
+
+    /// Compute a deterministic hash of the manifest content.
+    /// The hash is stable across runs and independent of HashMap iteration order.
+    pub fn compute_hash(&self) -> String {
+        let normalized = self.to_normalized();
+        let json = serde_json::to_string(&normalized).expect("manifest serialization should not fail");
+
+        let mut hasher = FxHasher::default();
+        hasher.write(json.as_bytes());
+        format!("{:016x}", hasher.finish())
     }
 }
 
@@ -269,5 +343,86 @@ myplugin = { marketplace = "unknown" }
         let manifest = Manifest::parse(content).unwrap();
         let result = manifest.validate();
         assert!(matches!(result, Err(Error::UndeclaredMarketplace(_))));
+    }
+
+    #[test]
+    fn test_hash_determinism_same_config() {
+        let content = r#"
+[marketplaces]
+official = "anthropics/plugins"
+
+[plugins]
+myplugin = { marketplace = "official" }
+"#;
+        let manifest1 = Manifest::parse(content).unwrap();
+        let manifest2 = Manifest::parse(content).unwrap();
+
+        assert_eq!(manifest1.compute_hash(), manifest2.compute_hash());
+    }
+
+    #[test]
+    fn test_hash_determinism_order_independent() {
+        // Marketplaces and plugins in different order should produce same hash
+        let content1 = r#"
+[marketplaces]
+alpha = "owner/alpha"
+beta = "owner/beta"
+
+[plugins]
+plugin-a = { marketplace = "alpha" }
+plugin-b = { marketplace = "beta" }
+"#;
+        let content2 = r#"
+[marketplaces]
+beta = "owner/beta"
+alpha = "owner/alpha"
+
+[plugins]
+plugin-b = { marketplace = "beta" }
+plugin-a = { marketplace = "alpha" }
+"#;
+        let manifest1 = Manifest::parse(content1).unwrap();
+        let manifest2 = Manifest::parse(content2).unwrap();
+
+        assert_eq!(manifest1.compute_hash(), manifest2.compute_hash());
+    }
+
+    #[test]
+    fn test_hash_changes_with_content() {
+        let content1 = r#"
+[marketplaces]
+official = "owner/repo"
+
+[plugins]
+plugin-a = { marketplace = "official" }
+"#;
+        let content2 = r#"
+[marketplaces]
+official = "owner/repo"
+
+[plugins]
+plugin-a = { marketplace = "official" }
+plugin-b = { marketplace = "official" }
+"#;
+        let manifest1 = Manifest::parse(content1).unwrap();
+        let manifest2 = Manifest::parse(content2).unwrap();
+
+        assert_ne!(manifest1.compute_hash(), manifest2.compute_hash());
+    }
+
+    #[test]
+    fn test_hash_format() {
+        let content = r#"
+[marketplaces]
+official = "owner/repo"
+
+[plugins]
+"#;
+        let manifest = Manifest::parse(content).unwrap();
+        let hash = manifest.compute_hash();
+
+        // Hash should be 16 hex characters (64-bit)
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

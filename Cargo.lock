@@ -659,6 +659,7 @@ dependencies = [
  "clap",
  "git2",
  "rootcause",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tempfile",

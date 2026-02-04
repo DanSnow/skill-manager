@@ -50,6 +50,9 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
     let resolver = MarketplaceResolver::new(cache.cache_dir().to_path_buf());
     let claude = ClaudeCodeIntegration::new();
 
+    // Compute manifest hash for change detection
+    let current_hash = manifest.compute_hash();
+
     // Check for existing lock file
     let lock_path = LockFile::path_for_manifest(&manifest_path);
     let existing_lock = if !update {
@@ -58,23 +61,36 @@ pub fn run(update: bool, _prefer_global: bool, _prefer_project: bool) -> Result<
         None
     };
 
+    // Determine if we need to re-resolve based on hash comparison
+    let needs_resolve = update
+        || existing_lock.is_none()
+        || existing_lock
+            .as_ref()
+            .is_some_and(|lock| lock.config_hash.as_ref() != Some(&current_hash));
+
     // Resolve or use locked versions
-    let (locked_marketplaces, locked_packages) = if let Some(ref lock) = existing_lock {
+    let (locked_marketplaces, locked_packages) = if !needs_resolve {
+        let lock = existing_lock.as_ref().unwrap();
         println!("Using locked versions from {}", lock_path.display());
         (lock.marketplaces.clone(), lock.packages.clone())
     } else {
-        println!("Resolving plugin versions...");
+        if existing_lock.is_some() && !update {
+            println!("Config changed, re-resolving plugin versions...");
+        } else {
+            println!("Resolving plugin versions...");
+        }
         resolve_all(&manifest, &resolver)?
     };
 
-    // Create/update lock file
+    // Create/update lock file with current hash
     let lock_file = LockFile {
+        config_hash: Some(current_hash),
         marketplaces: locked_marketplaces.clone(),
         packages: locked_packages.clone(),
         path: Some(lock_path.clone()),
     };
 
-    if existing_lock.is_none() || update {
+    if needs_resolve {
         lock_file.save(&lock_path)?;
         println!("Wrote {}", lock_path.display());
     }

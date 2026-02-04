@@ -43,6 +43,9 @@ pub struct LockedPackage {
 /// The plugins.lock file structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LockFile {
+    /// Hash of the manifest content for change detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
     #[serde(default, rename = "marketplace")]
     pub marketplaces: Vec<LockedMarketplace>,
     #[serde(default, rename = "package")]
@@ -153,6 +156,7 @@ resolved_version = "1.0.0"
     #[test]
     fn test_serialize_lock_file() {
         let lockfile = LockFile {
+            config_hash: Some("abc123def456".to_string()),
             marketplaces: vec![LockedMarketplace {
                 name: "official".to_string(),
                 url: "https://github.com/anthropics/claude-plugins-official.git".to_string(),
@@ -178,6 +182,7 @@ resolved_version = "1.0.0"
     #[test]
     fn test_round_trip() {
         let original = LockFile {
+            config_hash: Some("fedcba9876543210".to_string()),
             marketplaces: vec![LockedMarketplace {
                 name: "test".to_string(),
                 url: "https://example.com/repo.git".to_string(),
@@ -197,6 +202,7 @@ resolved_version = "1.0.0"
         let serialized = original.to_string().unwrap();
         let parsed = LockFile::parse(&serialized).unwrap();
 
+        assert_eq!(original.config_hash, parsed.config_hash);
         assert_eq!(original.marketplaces, parsed.marketplaces);
         assert_eq!(original.packages, parsed.packages);
     }
@@ -210,5 +216,47 @@ resolved_version = "1.0.0"
         let parsed = LockFile::parse(&content).unwrap();
         assert!(parsed.marketplaces.is_empty());
         assert!(parsed.packages.is_empty());
+    }
+
+    #[test]
+    fn test_config_hash_serialization() {
+        let lockfile = LockFile {
+            config_hash: Some("0123456789abcdef".to_string()),
+            marketplaces: vec![],
+            packages: vec![],
+            path: None,
+        };
+
+        let content = lockfile.to_string().unwrap();
+        assert!(content.contains("config_hash = \"0123456789abcdef\""));
+
+        let parsed = LockFile::parse(&content).unwrap();
+        assert_eq!(parsed.config_hash, Some("0123456789abcdef".to_string()));
+    }
+
+    #[test]
+    fn test_missing_config_hash_parses_as_none() {
+        // Old lock files without config_hash should still parse
+        let content = r#"
+[[marketplace]]
+name = "test"
+url = "https://example.com/repo.git"
+commit = "abc123"
+"#;
+        let parsed = LockFile::parse(content).unwrap();
+        assert_eq!(parsed.config_hash, None);
+    }
+
+    #[test]
+    fn test_config_hash_not_serialized_when_none() {
+        let lockfile = LockFile {
+            config_hash: None,
+            marketplaces: vec![],
+            packages: vec![],
+            path: None,
+        };
+
+        let content = lockfile.to_string().unwrap();
+        assert!(!content.contains("config_hash"));
     }
 }
